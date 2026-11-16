@@ -235,7 +235,6 @@ export function parse(markdown) {
   try {
     return renderDocument(markdown);
   } catch (e) {
-    if (process.env.MARKDOWN_PARSE_DEBUG === '1') throw e;
     fallbackCount++;
     return marked.parse(markdown);
   }
@@ -428,8 +427,8 @@ function startsBlock(src, i, end) {
   if (c === 60) return isHtmlLine(src, j, 0, le);
   if (c === 35) return isHeadingLine(src, j, 0, le);
   if (c === 62) return true;
-  if (c === 45 || c === 95 || c === 42) {
-    if (isHrLine(src, j, 0, le)) return true;
+  if (c === 45 || c === 95 || c === 42 || c === 43) {
+    if ((c === 45 || c === 95 || c === 42) && isHrLine(src, j, 0, le)) return true;
     return isParagraphListLine(src, j, 0, le);
   }
   if (c === 96 || c === 126) return isFenceLine(src, j, 0, le);
@@ -437,10 +436,61 @@ function startsBlock(src, i, end) {
   return false;
 }
 
+function isAnyListStart(src, i, max, end) {
+  const sp = countSpaces(src, i, end);
+  if (sp > max) return false;
+  let j = i + sp;
+  const ch = src.charCodeAt(j);
+  if (ch === 42 || ch === 43 || ch === 45) j++;
+  else if (ch >= 48 && ch <= 57) {
+    let d = 0;
+    while (j < end && d < 9) {
+      const c = src.charCodeAt(j);
+      if (c < 48 || c > 57) break;
+      j++;
+      d++;
+    }
+    if (d === 0) return false;
+    const c2 = src.charCodeAt(j);
+    if (c2 !== 46 && c2 !== 41) return false;
+    j++;
+  } else return false;
+  if (j >= end) return true;
+  const c = src.charCodeAt(j);
+  return c === 32 || c === 9 || c === 10;
+}
+
+// The block start list a block quote's lazy continuation line stops at.
+function startsQuoteBlock(src, i, end) {
+  if (i >= end) return false;
+  let j = i;
+  const sp = countSpaces(src, i, end);
+  if (sp > 0) {
+    if (sp > 3) return false;
+    j = i + sp;
+    if (j >= end) return false;
+  }
+  const c = src.charCodeAt(j);
+  const le = lineEnd(src, j);
+  if (c === 60) return isHtmlLine(src, j, 0, le);
+  if (c === 35) return isHeadingLine(src, j, 0, le);
+  if (c === 62) return true;
+  if (c === 45 || c === 95 || c === 42) {
+    if (isHrLine(src, j, 0, le)) return true;
+    return isAnyListStart(src, j, 0, le);
+  }
+  if (c === 43) return isAnyListStart(src, j, 0, le);
+  if (c === 96 || c === 126) return isFenceLine(src, j, 0, le);
+  if (c >= 48 && c <= 57) return isAnyListStart(src, j, 0, le);
+  return false;
+}
+
 function startsTable(src, i, end) {
   const eol = lineEnd(src, i);
   if (eol >= end) return false;
-  if (i >= end || src.charCodeAt(i) === 32) return false;
+  let j = i;
+  while (j < eol && src.charCodeAt(j) === 32) j++;
+  if (j >= eol) return false;
   const next = eol + 1;
   if (next >= end) return false;
   return isTableDelimLine(src, next, 3, lineEnd(src, next));
@@ -628,7 +678,7 @@ function tryBlockquote(src, p, doc) {
     while (q < n) {
       const le = lineEnd(src, q);
       if (le < n && isBlankStr(src.slice(q, le))) break;
-      if (startsBlock(src, q, n)) break;
+      if (startsQuoteBlock(src, q, n)) break;
       q = le < n ? le + 1 : n;
       last = q;
     }
@@ -880,7 +930,7 @@ function tryList(src, p, doc) {
           while (lns < lineNoTabs.length && lineNoTabs.charCodeAt(lns) === 32) lns++;
           if (blank || lns >= 4 || isFenceStr(line, 3) || isHeadingStr(line, 3) || isHtmlStr(line, 3) || isHrStr(line, 3))
             break;
-          if (isSetextLine(U) && !isHeadingLikeStr(line)) {
+          if (line !== '' && isSetextLine(U) && !isHeadingLikeStr(line)) {
             let k = 0;
             while (k < 3 && k < Z.length && Z.charCodeAt(k) === 32) k++;
             text += '\n' + '    ' + Z.slice(k);
@@ -1029,14 +1079,29 @@ function isHtmlStr(s, max, single) {
   return false;
 }
 
+// The block starts a setext heading's text stops at (and may not start with).
+const RE_LHEAD_LIST = /^ {0,3}(?:[*+-]|\d{1,9}[.)]) /;
+const RE_LHEAD_INDENT = /^(?: {4}| {0,3}\t)/;
+const RE_LHEAD_FENCE = /^ {0,3}(?:`{3,}|~{3,})/;
+const RE_LHEAD_QUOTE = /^ {0,3}>/;
+const RE_LHEAD_HEADING = /^ {0,3}#{1,6}(?:\s|$)/;
+const RE_LHEAD_TAGLINE = /^ {0,3}<[^\n>]+>$/;
+const RE_LHEAD_DELIM = /^ {0,3}\|?(?:[:\- ]*\|)+[:\- ]*$/;
+
+function lheadingStopLine(line, first) {
+  if (!first && isBlankStr(line)) return true;
+  if (first && RE_LHEAD_INDENT.test(line)) return true;
+  if (RE_LHEAD_LIST.test(line)) return true;
+  if (RE_LHEAD_FENCE.test(line)) return true;
+  if (RE_LHEAD_QUOTE.test(line)) return true;
+  if (RE_LHEAD_HEADING.test(line)) return true;
+  if (RE_LHEAD_TAGLINE.test(line)) return true;
+  if (RE_LHEAD_DELIM.test(line)) return true;
+  return !first && isHrStr(line, 3);
+}
+
 function isHeadingLikeStr(s) {
-  return (
-    /^ {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/.test(s) ||
-    /^(?: {4}| {0,3}\t)/.test(s) ||
-    isFenceStr(s, 3) ||
-    /^ {0,3}>/.test(s) ||
-    isHeadingStr(s, 3)
-  );
+  return lheadingStopLine(s, true);
 }
 
 /* --------------------------------------------------------------------- html */
@@ -1329,9 +1394,10 @@ function tryTable(src, p) {
   const n = src.length;
   const eol = lineEnd(src, p);
   if (eol >= n) return null;
-  if (src.charCodeAt(p) === 32) return null;
+  let hsp = 0;
+  while (p + hsp < eol && src.charCodeAt(p + hsp) === 32) hsp++;
+  if (p + hsp >= eol) return null;
   const headerLine = src.slice(p, eol);
-  if (headerLine.length === 0) return null;
   const delimEol = lineEnd(src, eol + 1);
   const delimLine = src.slice(eol + 1, delimEol);
   const delimTrim = delimLine.trim();
@@ -1383,17 +1449,14 @@ function tryLheading(src, p) {
   const firstEol = lineEnd(src, p);
   if (firstEol >= n) return null;
   const firstLine = src.slice(p, firstEol);
-  if (isHeadingLikeStr(firstLine)) return null;
-  if (isTableDelimLine(src, p, 0, firstEol)) return null;
+  if (lheadingStopLine(firstLine, true)) return null;
   let q = p;
   let textEnd = p;
   for (;;) {
     const le = lineEnd(src, q);
     if (q > p) {
       const line = src.slice(q, le);
-      if (isBlankStr(line)) return null;
-      if (startsBlock(src, q, n)) return null;
-      if (isTableDelimLine(src, q, 3, le)) return null;
+      if (lheadingStopLine(line, false)) return null;
     }
     textEnd = le;
     if (le >= n) return null;
@@ -1558,13 +1621,12 @@ function blockTokensInto(src, out, lazy, doc, topArg) {
       continue;
     }
     if (st.top) {
-      const before = p;
       r = tryParagraph(src, p);
       p = r[0];
       const prev = out[out.length - 1];
       if (lazy && prev && prev.type === 'para') prev.text += '\n' + r[1].text;
       else out.push(r[1]);
-      lazy = p !== before;
+      lazy = false;
       continue;
     }
     r = tryText(src, p);
@@ -1743,6 +1805,8 @@ const TEXT_CLASS = new Uint8Array(128);
 for (let c = 0; c < 128; c++) if (STOP_TEXT[c]) TEXT_CLASS[c] = 1;
 TEXT_CLASS[32] = 2;
 for (const ch of 'hHfFwW') TEXT_CLASS[ch.charCodeAt(0)] |= 4;
+for (const ch of '&<>"\'') TEXT_CLASS[ch.charCodeAt(0)] |= 8;
+let runSpecial = false;
 
 function maskSource(src, doc) {
   let t = src;
@@ -2008,16 +2072,19 @@ function inlineCore(src, doc, plain) {
         }
       }
     }
+    runSpecial = false;
     const len = scanInlineText(src, i, hasAtAll);
     if (len <= 0) throw FALLBACK;
     const raw = src.slice(i, i + len);
-    if (raw.includes('&')) {
+    if (!runSpecial) out += raw;
+    else if (raw.includes('&')) {
       if (plain) out += state.inRawBlock ? raw : unescapeEntities(raw);
       else out += state.inRawBlock ? esc(raw) : esc(unescapeEntities(raw));
     } else if (plain) out += raw;
     else out += esc(raw);
     i += len;
-    lastChar = raw.charCodeAt(raw.length - 1) === 95 ? '' : raw[raw.length - 1];
+    if (raw.charCodeAt(raw.length - 1) !== 95) lastChar = raw[raw.length - 1];
+    else if (lastChar === '') lastChar = '';
   }
   return out;
 }
@@ -2255,7 +2322,6 @@ function tryEmStrong(src, i, doc, plain, lastChar, mask, lastOf) {
   }
   if (!s1 && !s2 && !s3 && !s4) return null;
   const masked = mask();
-  if (masked[i] !== ch) return null;
   const g1 = s1 || s3;
   const o = lastChar === ch;
   let l = i;
@@ -2323,7 +2389,6 @@ function tryDel(src, i, doc, plain, lastChar, mask, lastOf) {
   }
   if (!g1 && !(i + k < src.length && !isSpaceChar(src[i + k]) && src[i + k] !== '~')) return null;
   const masked = mask();
-  if (masked[i] !== '~') return null;
   if (!g1 || !lastChar || isPunctOrSpace(lastChar)) {
     const o = k;
     let p = o;
@@ -2358,6 +2423,10 @@ function tryDel(src, i, doc, plain, lastChar, mask, lastOf) {
 function scanInlineText(src, i, hasAtAll) {
   const n = src.length;
   const c0 = src.charCodeAt(i);
+  if (c0 === 38 || c0 === 60 || c0 === 62 || c0 === 34 || c0 === 39) runSpecial = true;
+  if (!isAsciiAlnum(c0)) {
+    if (src.startsWith('mailto:', i + 1) || src.startsWith('xmpp:', i + 1)) return 1;
+  }
   if (c0 === 96 || c0 === 126) {
     let k = 1;
     while (i + k < n && src.charCodeAt(i + k) === c0) k++;
@@ -2366,9 +2435,6 @@ function scanInlineText(src, i, hasAtAll) {
       if (nc === 96 || nc === 126) return k;
     }
     return k + scanTextRun(src, i + k, n, hasAtAll);
-  }
-  if (!isAsciiAlnum(c0)) {
-    if (src.startsWith('mailto:', i + 1) || src.startsWith('xmpp:', i + 1)) return 1;
   }
   return 1 + scanTextRun(src, i + 1, n, hasAtAll);
 }
@@ -2389,6 +2455,7 @@ function scanTextRun(src, from, n, hasAtAll) {
         j++;
         continue;
       }
+      if (cl & 8) runSpecial = true;
       if (cl & 1) break;
       if (cl & 2) {
         let m = j + 1;
@@ -2423,6 +2490,8 @@ function scanTextRun(src, from, n, hasAtAll) {
     const c = src.charCodeAt(j);
     if (atPos < j) atPos = src.indexOf('@', j);
     if (c < 128) {
+      if (TEXT_CLASS[c] & 8) runSpecial = true;
+      if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) runSpecial = true;
       if (STOP_TEXT[c]) break;
       if ((c | 32) === 104) {
         if (((src.charCodeAt(j + 1) | 32) === 116) && ((src.charCodeAt(j + 2) | 32) === 116) && ((src.charCodeAt(j + 3) | 32) === 112)) break;
@@ -2440,6 +2509,11 @@ function scanTextRun(src, from, n, hasAtAll) {
       while (m < n && src.charCodeAt(m) === 32) m++;
       if (m - j - 1 >= 2 && m < n && src.charCodeAt(m) === 10) return j - from + 1;
     }
+    if (c < 48 || c > 57) {
+      if ((c < 65 || c > 90) && (c < 97 || c > 122) && j + 7 <= n) {
+        if (src.startsWith('mailto:', j + 1) || src.startsWith('xmpp:', j + 1)) return j - from + 1;
+      }
+    }
     if (atPos > j && !(c < 128 && LOCAL_CHAR[c] === 1)) {
       if (!(j + 1 < runEnd)) {
         let m2 = j + 1;
@@ -2447,8 +2521,6 @@ function scanTextRun(src, from, n, hasAtAll) {
         runEnd = m2;
       }
       if (runEnd > j + 1 && runEnd < n && src.charCodeAt(runEnd) === 64) return j - from + 1;
-      if (j + 7 < n && (src.startsWith('mailto:', j + 1) || src.startsWith('xmpp:', j + 1)))
-        return j - from + 1;
     }
     j++;
   }

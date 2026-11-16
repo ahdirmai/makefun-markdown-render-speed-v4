@@ -22,7 +22,8 @@ const kit = resolve(flag('--kit', process.env.KIT_DIR ??
 const cases = JSON.parse(readFileSync(join(kit, 'practice/input/cases.json'), 'utf8'));
 const expected = JSON.parse(readFileSync(join(kit, 'practice/reference/expected.json'), 'utf8'));
 
-const { parse } = await import(pathToFileURL(join(root, 'parse.js')).href);
+const mod = await import(pathToFileURL(join(root, 'parse.js')).href);
+const { parse } = mod;
 
 function compare(render, label) {
   let matches = 0;
@@ -51,6 +52,7 @@ function compare(render, label) {
 
 console.log(`cases ${cases.length}`);
 console.log(`match ${compare(parse, 'candidate')}/${cases.length}`);
+if (typeof mod.stats === 'function') console.log(`fallbacks ${mod.stats()}`);
 
 function time(run) {
   const before = process.cpuUsage();
