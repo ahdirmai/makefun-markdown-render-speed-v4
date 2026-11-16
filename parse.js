@@ -227,6 +227,7 @@ export function parse(markdown) {
   try {
     return renderDocument(markdown);
   } catch (e) {
+    if (process.env.MARKDOWN_PARSE_DEBUG === '1') throw e;
     fallbackCount++;
     return marked.parse(markdown);
   }
@@ -713,6 +714,15 @@ function matchItem(src, i, marker) {
   return { markerEnd, restStart: markerEnd, restEnd, lineAfter: eol < end ? eol + 1 : end };
 }
 
+function endsWithBlankLine(raw) {
+  let i = raw.length - 1;
+  while (i >= 0 && (raw.charCodeAt(i) === 32 || raw.charCodeAt(i) === 9)) i--;
+  if (i < 0 || raw.charCodeAt(i) !== 10) return false;
+  i--;
+  while (i >= 0 && (raw.charCodeAt(i) === 32 || raw.charCodeAt(i) === 9)) i--;
+  return i >= 0 && raw.charCodeAt(i) === 10;
+}
+
 function tryList(src, p, doc) {
   const n = src.length;
   const sp = countSpaces(src, p, n);
@@ -833,7 +843,7 @@ function tryList(src, p, doc) {
     const raw = src.slice(itemStart, e);
     if (!list.loose) {
       if (prevBlank) list.loose = true;
-      else if (/\n[ \t]*\n[ \t]*$/.test(raw)) prevBlank = true;
+      else if (endsWithBlankLine(raw)) prevBlank = true;
     }
     list.items.push({ type: 'list_item', raw, text, tokens: [], task: false, checked: false });
     pos = e;
@@ -1632,7 +1642,12 @@ const RE_EM_UND =
 const RE_DEL_R =
   /^[^~]+(?=[^~])|(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
 
-const EMAIL_LOCAL = /[a-zA-Z0-9.!#$%&'*+\/=?_`{|}~-]/;
+const LOCAL_CHAR = new Uint8Array(128);
+for (const ch of "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&'*+/=?_{|}~-`")
+  LOCAL_CHAR[ch.charCodeAt(0)] = 1;
+function isLocalChar(code) {
+  return code < 128 && LOCAL_CHAR[code] === 1;
+}
 const ESCAPABLE = new Uint8Array(128);
 for (const ch of '!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~') ESCAPABLE[ch.charCodeAt(0)] = 1;
 const STOP_TEXT = new Uint8Array(128);
@@ -1643,13 +1658,17 @@ function maskSource(src, doc) {
   if (doc.links && src.includes('[') && hasLinks(doc)) {
     t = t.replace(RE_REF_SEARCH, (m) => maskRef(m, doc));
   }
-  t = t.replace(RE_ANY_PUNCT_CODE, (m, s, r) =>
-    r ? '+'.repeat(m.length) : s ? s + m.slice(s.length, -s.length).replace(/`/g, '+') + s : m,
-  );
-  t = t.replace(RE_BLOCK_SKIP, (m, s, r) => {
-    const o = r ? r.length : 0;
-    return m.slice(0, o) + '[' + 'a'.repeat(m.length - o - 2) + ']';
-  });
+  if (t.includes('`') || t.includes('\\')) {
+    t = t.replace(RE_ANY_PUNCT_CODE, (m, s, r) =>
+      r ? '+'.repeat(m.length) : s ? s + m.slice(s.length, -s.length).replace(/`/g, '+') + s : m,
+    );
+  }
+  if (t.includes('[') || t.includes('`') || t.includes('<')) {
+    t = t.replace(RE_BLOCK_SKIP, (m, s, r) => {
+      const o = r ? r.length : 0;
+      return m.slice(0, o) + '[' + 'a'.repeat(m.length - o - 2) + ']';
+    });
+  }
   return t;
 }
 
@@ -1684,15 +1703,15 @@ function linkInText(s, doc) {
   return false;
 }
 
-function lastDelimIndex(masked, ch) {
+function lastDelimIndex(masked, code) {
   let last = -1;
   const n = masked.length;
   for (let i = 0; i < n; i++) {
-    if (masked[i] !== ch) continue;
-    const prev = i === 0 ? '\n' : masked[i - 1];
+    if (masked.charCodeAt(i) !== code) continue;
+    const prev = i === 0 ? 10 : masked.charCodeAt(i - 1);
     let j = i + 1;
-    while (j < n && masked[j] === ch) j++;
-    if (!isSpaceChar(prev)) last = i;
+    while (j < n && masked.charCodeAt(j) === code) j++;
+    if (!(prev === 32 || prev === 9 || prev === 10 || prev === 13 || prev === 12)) last = i;
     i = j - 1;
   }
   return last;
@@ -1720,19 +1739,32 @@ function inlineCore(src, doc, plain) {
   let out = '';
   let i = 0;
   let lastChar = '';
+  const lastNonWs = src.trimEnd().length;
+  const hasAt = src.includes('@');
+  let runStart = -1;
+  let runEnd = -1;
+  const localRunEnd = (pos) => {
+    if (pos >= runStart && pos < runEnd) return runEnd;
+    let e = pos;
+    while (e < n && isLocalChar(src.charCodeAt(e))) e++;
+    runStart = pos;
+    runEnd = e;
+    return e;
+  };
   let masked = null;
   let lasts = null;
   const mask = () => {
     if (masked === null) {
       masked = maskSource(src, doc);
-      lasts = { '*': -2, _: -2, '~': -2 };
+      lasts = [-2, -2, -2];
     }
     return masked;
   };
-  const lastOf = (ch) => {
+  const lastOf = (code) => {
     mask();
-    if (lasts[ch] === -2) lasts[ch] = lastDelimIndex(masked, ch);
-    return lasts[ch];
+    const slot = code === 42 ? 0 : code === 95 ? 1 : 2;
+    if (lasts[slot] === -2) lasts[slot] = lastDelimIndex(masked, code);
+    return lasts[slot];
   };
   while (i < n) {
     const c = src.charCodeAt(i);
@@ -1806,11 +1838,19 @@ function inlineCore(src, doc, plain) {
         continue;
       }
     }
-    if (c === 10 || c === 32 || c === 92) {
-      const m = RE_BR.exec(src.slice(i));
-      if (m) {
+    if (c === 32 || c === 92) {
+      let after = -1;
+      if (c === 32) {
+        let k = 0;
+        while (i + k < n && src.charCodeAt(i + k) === 32) k++;
+        if (k >= 2 && i + k < n && src.charCodeAt(i + k) === 10) after = i + k + 1;
+      } else if (i + 1 < n && src.charCodeAt(i + 1) === 10) {
+        after = i + 2;
+      }
+      if (after >= 0 && after < lastNonWs) {
+        while (after < n && (src.charCodeAt(after) === 32 || src.charCodeAt(after) === 9)) after++;
         out += plain ? '' : '<br>';
-        i += m[0].length;
+        i = after;
         lastChar = '';
         continue;
       }
@@ -1840,25 +1880,35 @@ function inlineCore(src, doc, plain) {
       }
     }
     if (!state.inLink) {
-      const m = RE_URL.exec(src.slice(i));
-      if (m) {
-        const r = urlToken(m, plain);
-        out += r.html;
-        i += r.len;
-        lastChar = '';
-        continue;
+      const lower = c | 32;
+      let tryUrl = lower === 104 || lower === 102 || c === 119;
+      if (!tryUrl && hasAt && isLocalChar(c)) {
+        if (lower === 109 && src.startsWith('mailto:', i)) tryUrl = true;
+        else if (lower === 120 && src.startsWith('xmpp:', i)) tryUrl = true;
+        else {
+          const e = localRunEnd(i);
+          if (e < n && src.charCodeAt(e) === 64) tryUrl = true;
+        }
+      }
+      if (tryUrl) {
+        const m = RE_URL.exec(src.slice(i));
+        if (m) {
+          const r = urlToken(m, plain);
+          out += r.html;
+          i += r.len;
+          lastChar = '';
+          continue;
+        }
       }
     }
     const len = scanInlineText(src, i);
     if (len <= 0) throw FALLBACK;
     const raw = src.slice(i, i + len);
-    if (plain) {
-      out += state.inRawBlock ? raw : unescapeEntities(raw);
-    } else {
-      let text = raw;
-      if (!state.inRawBlock) text = unescapeEntities(text);
-      out += esc(text);
-    }
+    if (raw.includes('&')) {
+      if (plain) out += state.inRawBlock ? raw : unescapeEntities(raw);
+      else out += state.inRawBlock ? esc(raw) : esc(unescapeEntities(raw));
+    } else if (plain) out += raw;
+    else out += esc(raw);
     i += len;
     lastChar = raw.charCodeAt(raw.length - 1) === 95 ? '' : raw[raw.length - 1];
   }
@@ -2090,7 +2140,7 @@ function tryEmStrong(src, i, doc, plain, lastChar, mask, lastOf) {
     const y = i - l + k;
     const R = pChar.trim() !== '' && (!!d || (ch === '*' && !h));
     const A = ch === '*' ? RE_EM_AST : RE_EM_UND;
-    const v = lastOf(ch);
+    const v = lastOf(c);
     const Q = i + k;
     if (v < Q) return null;
     const t2 = masked.slice(i + k);
@@ -2143,7 +2193,7 @@ function tryDel(src, i, doc, plain, lastChar, mask, lastOf) {
   if (!g1 || !lastChar || isPunctOrSpace(lastChar)) {
     const o = k;
     let p = o;
-    const v = lastOf('~');
+    const v = lastOf(126);
     const d = i + o;
     if (v < d) return null;
     const t2 = masked.slice(i + o);
@@ -2184,8 +2234,7 @@ function scanInlineText(src, i) {
     return k + scanTextRun(src, i + k, n);
   }
   if (!isAsciiAlnum(c0)) {
-    const rest = src.slice(i + 1, i + 8);
-    if (rest.startsWith('mailto:') || rest.startsWith('xmpp:')) return 1;
+    if (src.startsWith('mailto:', i + 1) || src.startsWith('xmpp:', i + 1)) return 1;
   }
   return 1 + scanTextRun(src, i + 1, n);
 }
@@ -2199,20 +2248,27 @@ function scanTextRun(src, from, n) {
   let sp = from;
   while (sp < n && src.charCodeAt(sp) === 32) sp++;
   if (sp - from >= 2 && sp < n && src.charCodeAt(sp) === 10) return 0;
-  let em = from;
-  while (em < n && EMAIL_LOCAL.test(src[em])) em++;
-  if (em > from && em < n && src.charCodeAt(em) === 64) return 0;
+  let atPos = src.indexOf('@', from);
+  if (atPos >= 0) {
+    let em = from;
+    while (em < n && isLocalChar(src.charCodeAt(em))) em++;
+    if (em > from && em < n && src.charCodeAt(em) === 64) return 0;
+  }
+  let runEnd = -1;
   let j = from;
   while (j < n) {
     const c = src.charCodeAt(j);
+    if (atPos >= 0 && atPos < j) atPos = src.indexOf('@', j);
     if (c < 128) {
       if (STOP_TEXT[c]) break;
-      if ((c === 104 || c === 72) && startsWithCI(src, j, 'http')) break;
-      if ((c === 102 || c === 70) && startsWithCI(src, j, 'ftp://')) break;
-      if (c === 119 || c === 87) {
-        if (startsWithCI(src, j, 'www.')) {
-          const prev = j === 0 ? '' : src[j - 1];
-          if (j === 0 || prev === '*' || prev === '_' || prev === '~' || prev === '(' || /\s/.test(prev)) break;
+      if ((c | 32) === 104) {
+        if (((src.charCodeAt(j + 1) | 32) === 116) && ((src.charCodeAt(j + 2) | 32) === 116) && ((src.charCodeAt(j + 3) | 32) === 112)) break;
+      } else if ((c | 32) === 102) {
+        if (((src.charCodeAt(j + 1) | 32) === 116) && ((src.charCodeAt(j + 2) | 32) === 112) && src.charCodeAt(j + 3) === 58 && src.charCodeAt(j + 4) === 47 && src.charCodeAt(j + 5) === 47) break;
+      } else if (c === 119) {
+        if (src.charCodeAt(j + 1) === 119 && src.charCodeAt(j + 2) === 119 && src.charCodeAt(j + 3) === 46) {
+          const prev = j === 0 ? 10 : src.charCodeAt(j - 1);
+          if (prev === 42 || prev === 95 || prev === 126 || prev === 40 || prev === 0 || prev === 32 || prev === 9 || prev === 10 || prev === 13 || prev === 12) break;
         }
       }
     }
@@ -2221,16 +2277,21 @@ function scanTextRun(src, from, n) {
       while (m < n && src.charCodeAt(m) === 32) m++;
       if (m - j - 1 >= 2 && m < n && src.charCodeAt(m) === 10) return j - from + 1;
     }
-    if (!EMAIL_LOCAL.test(src[j])) {
-      let m2 = j + 1;
-      while (m2 < n && EMAIL_LOCAL.test(src[m2])) m2++;
-      if (m2 > j + 1 && m2 < n && src.charCodeAt(m2) === 64) return j - from + 1;
-      const rest = src.slice(j + 1, j + 8);
-      if (rest.startsWith('mailto:') || rest.startsWith('xmpp:')) return j - from + 1;
-    } else {
-      let m2 = j;
-      while (m2 < n && EMAIL_LOCAL.test(src[m2])) m2++;
-      if (m2 < n && src.charCodeAt(m2) === 64) break;
+    if (atPos > j && !isLocalChar(c)) {
+      if (!(j + 1 < runEnd)) {
+        let m2 = j + 1;
+        while (m2 < n && isLocalChar(src.charCodeAt(m2))) m2++;
+        runEnd = m2;
+      }
+      if (runEnd > j + 1 && runEnd < n && src.charCodeAt(runEnd) === 64) return j - from + 1;
+      if (j + 7 < n && (src.startsWith('mailto:', j + 1) || src.startsWith('xmpp:', j + 1)))
+        return j - from + 1;
+    }
+    if (c === 32 && atPos < 0) {
+      let m = j + 1;
+      while (m < n && src.charCodeAt(m) === 32) m++;
+      j = m;
+      continue;
     }
     j++;
   }
