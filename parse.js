@@ -71,7 +71,9 @@ function unescapeEntities(s) {
   });
 }
 
+const RE_URI_PLAIN = /^[A-Za-z0-9;,/?:@&=+$\-_.!~*'()#]+$/;
 function encodeHref(href) {
+  if (RE_URI_PLAIN.test(href)) return href;
   try {
     return encodeURI(href).replace(/%25/g, '%');
   } catch {
@@ -79,8 +81,11 @@ function encodeHref(href) {
   }
 }
 
+const RE_PLAIN_LABEL = /^[\x20-\x7e]*$/;
 function labelKey(label) {
-  return label.trim().replace(/\s+/g, ' ').toLowerCase().toUpperCase().toLowerCase();
+  const t = label.trim();
+  if (RE_PLAIN_LABEL.test(t) && !/  /.test(t)) return t.toLowerCase();
+  return t.replace(/\s+/g, ' ').toLowerCase().toUpperCase().toLowerCase();
 }
 
 function rtrimChar(s, ch) {
@@ -123,6 +128,7 @@ function expandTabs(s, start) {
 }
 
 function expandLeadingTabs(s) {
+  if (s.indexOf('\t') < 0) return s;
   let i = 0;
   while (i < s.length && (s.charCodeAt(i) === 32 || s.charCodeAt(i) === 9)) i++;
   if (i === 0) return s;
@@ -244,14 +250,26 @@ function renderDocument(markdown) {
   return renderTokens(tokens, doc);
 }
 
+let lcSrc = null;
+let lcIdx = -1;
+let lcEnd = -1;
+let lcSp = -1;
 function lineEnd(src, i) {
+  if (src === lcSrc && i === lcIdx) return lcEnd;
   const j = src.indexOf('\n', i);
-  return j < 0 ? src.length : j;
+  const e = j < 0 ? src.length : j;
+  lcSrc = src;
+  lcIdx = i;
+  lcEnd = e;
+  lcSp = -1;
+  return e;
 }
 
 function countSpaces(src, i, end) {
+  if (src === lcSrc && i === lcIdx && end === lcEnd && lcSp >= 0) return lcSp;
   let k = 0;
   while (i + k < end && src.charCodeAt(i + k) === 32) k++;
+  if (src === lcSrc && i === lcIdx && end === lcEnd) lcSp = k;
   return k;
 }
 
@@ -1405,61 +1423,86 @@ function blockTokensInto(src, out, lazy, doc, topArg) {
   let p = 0;
   while (p < n) {
     let r;
-    if ((r = trySpace(src, p))) {
-      p = r[0];
-      const prev = out[out.length - 1];
-      if (r[1].raw.length === 1 && prev !== undefined) prev.raw = (prev.raw || '') + '\n';
-      else out.push(r[1]);
-      continue;
-    }
-    if ((r = tryCode(src, p))) {
-      p = r[0];
-      const prev = out[out.length - 1];
-      if (prev && (prev.type === 'para' || prev.type === 'text')) {
-        prev.text += '\n' + r[1].text;
-      } else out.push(r[1]);
-      continue;
-    }
-    if ((r = tryFences(src, p))) {
-      p = r[0];
-      out.push(r[1]);
-      continue;
-    }
-    if ((r = tryHeading(src, p))) {
-      p = r[0];
-      out.push(r[1]);
-      continue;
-    }
-    if ((r = tryHr(src, p))) {
-      p = r[0];
-      out.push(r[1]);
-      continue;
-    }
-    if ((r = tryBlockquote(src, p, doc))) {
-      p = r[0];
-      out.push(r[1]);
-      continue;
-    }
-    if ((r = tryList(src, p, doc))) {
-      p = r[0];
-      out.push(r[1]);
-      continue;
-    }
-    if ((r = tryHtml(src, p))) {
-      p = r[0];
-      out.push(r[1]);
-      continue;
-    }
-    if ((r = tryDef(src, p))) {
-      p = r[0];
-      const prev = out[out.length - 1];
-      if (prev && (prev.type === 'para' || prev.type === 'text')) {
-        prev.text += '\n' + r[1].raw;
-      } else {
-        if (!doc.links[r[1].tag]) doc.links[r[1].tag] = { href: r[1].href, title: r[1].title };
-        out.push(r[1]);
+    const c0 = src.charCodeAt(p);
+    if (c0 === 32 || c0 === 9 || c0 === 10) {
+      if ((r = trySpace(src, p))) {
+        p = r[0];
+        const prev = out[out.length - 1];
+        if (r[1].raw.length === 1 && prev !== undefined) prev.raw = (prev.raw || '') + '\n';
+        else out.push(r[1]);
+        continue;
       }
-      continue;
+    }
+    if (c0 === 32 || c0 === 9 || c0 === 10 || c0 === 96 || c0 === 126) {
+      if ((r = tryCode(src, p))) {
+        p = r[0];
+        const prev = out[out.length - 1];
+        if (prev && (prev.type === 'para' || prev.type === 'text')) prev.text += '\n' + r[1].text;
+        else out.push(r[1]);
+        continue;
+      }
+      if ((r = tryFences(src, p))) {
+        p = r[0];
+        out.push(r[1]);
+        continue;
+      }
+    }
+    if (c0 === 32 || c0 === 9 || c0 === 10 || c0 === 35) {
+      if ((r = tryHeading(src, p))) {
+        p = r[0];
+        out.push(r[1]);
+        continue;
+      }
+    }
+    if (c0 === 32 || c0 === 9 || c0 === 10 || c0 === 45 || c0 === 95 || c0 === 42) {
+      if ((r = tryHr(src, p))) {
+        p = r[0];
+        out.push(r[1]);
+        continue;
+      }
+    }
+    if (c0 === 32 || c0 === 9 || c0 === 10 || c0 === 62) {
+      if ((r = tryBlockquote(src, p, doc))) {
+        p = r[0];
+        out.push(r[1]);
+        continue;
+      }
+    }
+    if (
+      c0 === 32 ||
+      c0 === 9 ||
+      c0 === 10 ||
+      c0 === 45 ||
+      c0 === 95 ||
+      c0 === 42 ||
+      c0 === 43 ||
+      (c0 >= 48 && c0 <= 57)
+    ) {
+      if ((r = tryList(src, p, doc))) {
+        p = r[0];
+        out.push(r[1]);
+        continue;
+      }
+    }
+    if (c0 === 32 || c0 === 9 || c0 === 10 || c0 === 60) {
+      if ((r = tryHtml(src, p))) {
+        p = r[0];
+        out.push(r[1]);
+        continue;
+      }
+    }
+    if (c0 === 32 || c0 === 9 || c0 === 10 || c0 === 91) {
+      if ((r = tryDef(src, p))) {
+        p = r[0];
+        const prev = out[out.length - 1];
+        if (prev && (prev.type === 'para' || prev.type === 'text')) {
+          prev.text += '\n' + r[1].raw;
+        } else {
+          if (!doc.links[r[1].tag]) doc.links[r[1].tag] = { href: r[1].href, title: r[1].title };
+          out.push(r[1]);
+        }
+        continue;
+      }
     }
     if ((r = tryTable(src, p))) {
       p = r[0];
@@ -1726,11 +1769,9 @@ function inlineTo(src, doc, plain) {
   const st = doc.state;
   const savedParen = st.linkParenPossible;
   st.linkParenPossible = savedParen && src.includes(')');
-  try {
-    return inlineCore(src, doc, plain);
-  } finally {
-    st.linkParenPossible = savedParen;
-  }
+  const html = inlineCore(src, doc, plain);
+  st.linkParenPossible = savedParen;
+  return html;
 }
 
 function inlineCore(src, doc, plain) {
@@ -1739,8 +1780,20 @@ function inlineCore(src, doc, plain) {
   let out = '';
   let i = 0;
   let lastChar = '';
-  const lastNonWs = src.trimEnd().length;
-  const hasAt = src.includes('@');
+  let lastNonWs = -2;
+  const tailOf = () => {
+    if (lastNonWs === -2) {
+      let e = n;
+      while (e > 0) {
+        const cc = src.charCodeAt(e - 1);
+        if (cc === 32 || cc === 9 || cc === 10 || cc === 13 || cc === 12) e--;
+        else break;
+      }
+      lastNonWs = e;
+    }
+    return lastNonWs;
+  };
+  let hasAt = -1;
   let runStart = -1;
   let runEnd = -1;
   const localRunEnd = (pos) => {
@@ -1847,7 +1900,7 @@ function inlineCore(src, doc, plain) {
       } else if (i + 1 < n && src.charCodeAt(i + 1) === 10) {
         after = i + 2;
       }
-      if (after >= 0 && after < lastNonWs) {
+      if (after >= 0 && after < tailOf()) {
         while (after < n && (src.charCodeAt(after) === 32 || src.charCodeAt(after) === 9)) after++;
         out += plain ? '' : '<br>';
         i = after;
@@ -1882,6 +1935,7 @@ function inlineCore(src, doc, plain) {
     if (!state.inLink) {
       const lower = c | 32;
       let tryUrl = lower === 104 || lower === 102 || c === 119;
+      if (hasAt < 0) hasAt = src.includes('@') ? 1 : 0;
       if (!tryUrl && hasAt && isLocalChar(c)) {
         if (lower === 109 && src.startsWith('mailto:', i)) tryUrl = true;
         else if (lower === 120 && src.startsWith('xmpp:', i)) tryUrl = true;
@@ -2244,21 +2298,47 @@ function isAsciiAlnum(c) {
 }
 
 function scanTextRun(src, from, n) {
-  // zero-width alternatives tried right after the run's first character
+  let atPos = src.indexOf('@', from);
+  if (atPos < 0) {
+    // no e-mail can start ahead: only stop characters, schemes and hard breaks
+    let j = from;
+    while (j < n) {
+      const c = src.charCodeAt(j);
+      if (c < 128) {
+        if (STOP_TEXT[c]) break;
+        if (c === 32) {
+          let m = j + 1;
+          while (m < n && src.charCodeAt(m) === 32) m++;
+          if (m - j >= 2 && m < n && src.charCodeAt(m) === 10) return j - from;
+          j = m;
+          continue;
+        }
+        if ((c | 32) === 104) {
+          if (((src.charCodeAt(j + 1) | 32) === 116) && ((src.charCodeAt(j + 2) | 32) === 116) && ((src.charCodeAt(j + 3) | 32) === 112)) break;
+        } else if ((c | 32) === 102) {
+          if (((src.charCodeAt(j + 1) | 32) === 116) && ((src.charCodeAt(j + 2) | 32) === 112) && src.charCodeAt(j + 3) === 58 && src.charCodeAt(j + 4) === 47 && src.charCodeAt(j + 5) === 47) break;
+        } else if (c === 119) {
+          if (src.charCodeAt(j + 1) === 119 && src.charCodeAt(j + 2) === 119 && src.charCodeAt(j + 3) === 46) {
+            const prev = j === 0 ? 10 : src.charCodeAt(j - 1);
+            if (prev === 42 || prev === 95 || prev === 126 || prev === 40 || prev === 0 || prev === 32 || prev === 9 || prev === 10 || prev === 13 || prev === 12) break;
+          }
+        }
+      }
+      j++;
+    }
+    return j - from;
+  }
   let sp = from;
   while (sp < n && src.charCodeAt(sp) === 32) sp++;
   if (sp - from >= 2 && sp < n && src.charCodeAt(sp) === 10) return 0;
-  let atPos = src.indexOf('@', from);
-  if (atPos >= 0) {
-    let em = from;
-    while (em < n && isLocalChar(src.charCodeAt(em))) em++;
-    if (em > from && em < n && src.charCodeAt(em) === 64) return 0;
-  }
+  let em = from;
+  while (em < n && isLocalChar(src.charCodeAt(em))) em++;
+  if (em > from && em < n && src.charCodeAt(em) === 64) return 0;
   let runEnd = -1;
   let j = from;
   while (j < n) {
     const c = src.charCodeAt(j);
-    if (atPos >= 0 && atPos < j) atPos = src.indexOf('@', j);
+    if (atPos < j) atPos = src.indexOf('@', j);
     if (c < 128) {
       if (STOP_TEXT[c]) break;
       if ((c | 32) === 104) {
@@ -2277,7 +2357,7 @@ function scanTextRun(src, from, n) {
       while (m < n && src.charCodeAt(m) === 32) m++;
       if (m - j - 1 >= 2 && m < n && src.charCodeAt(m) === 10) return j - from + 1;
     }
-    if (atPos > j && !isLocalChar(c)) {
+    if (atPos > j && !(c < 128 && LOCAL_CHAR[c] === 1)) {
       if (!(j + 1 < runEnd)) {
         let m2 = j + 1;
         while (m2 < n && isLocalChar(src.charCodeAt(m2))) m2++;
@@ -2286,12 +2366,6 @@ function scanTextRun(src, from, n) {
       if (runEnd > j + 1 && runEnd < n && src.charCodeAt(runEnd) === 64) return j - from + 1;
       if (j + 7 < n && (src.startsWith('mailto:', j + 1) || src.startsWith('xmpp:', j + 1)))
         return j - from + 1;
-    }
-    if (c === 32 && atPos < 0) {
-      let m = j + 1;
-      while (m < n && src.charCodeAt(m) === 32) m++;
-      j = m;
-      continue;
     }
     j++;
   }
