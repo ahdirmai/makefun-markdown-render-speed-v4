@@ -51,12 +51,14 @@ const RE_NUM_REF = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
 const RE_NUM_REF_OR_AMP =
   /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
 
+const RE_ESC_ANGLES = /[<>"']/;
 function esc(s, encode) {
   if (encode) {
     if (RE_ESC_TEST.test(s)) return s.replace(RE_ESC_REPLACE, escChar);
-  } else if (RE_ESC_TEST_NO.test(s)) {
-    return s.replace(RE_ESC_REPLACE_NO, escChar);
+    return s;
   }
+  if (RE_ESC_ANGLES.test(s)) return s.replace(RE_ESC_REPLACE_NO, escChar);
+  if (s.indexOf('&') >= 0 && RE_ESC_TEST_NO.test(s)) return s.replace(RE_ESC_REPLACE_NO, escChar);
   return s;
 }
 
@@ -240,7 +242,7 @@ export function parse(markdown) {
 }
 
 function renderDocument(markdown) {
-  const src = markdown.replace(/\r\n|\r/g, '\n');
+  const src = markdown.indexOf('\r') < 0 ? markdown : markdown.replace(/\r\n|\r/g, '\n');
   const doc = {
     links: Object.create(null),
     state: { inLink: false, inRawBlock: false, linkParenPossible: true, top: true },
@@ -818,42 +820,75 @@ function tryList(src, p, doc) {
       done = true;
     }
     if (!done) {
+      const lim = Math.max(0, Math.min(3, R - 1));
       for (;;) {
         if (e >= n) break;
         const eol = lineEnd(src, e);
+        const sp = countSpaces(src, e, eol);
+        if (sp <= lim && e + sp < eol) {
+          const ch = src.charCodeAt(e + sp);
+          let stop = false;
+          switch (ch) {
+            case 96:
+            case 126:
+              stop = isFenceLine(src, e, lim, eol);
+              break;
+            case 35:
+              stop = isHeadingLine(src, e, lim, eol);
+              break;
+            case 60:
+              stop = isHtmlLine(src, e, lim, eol);
+              break;
+            case 62:
+              stop = isQuoteLine(src, e, lim, eol);
+              break;
+            case 45:
+            case 42:
+              stop = isBulletLine(src, e, lim, eol) || isHrLine(src, e, lim, eol);
+              break;
+            case 43:
+              stop = isBulletLine(src, e, lim, eol);
+              break;
+            case 95:
+              stop = isHrLine(src, e, lim, eol);
+              break;
+            default:
+              if (ch >= 48 && ch <= 57) stop = isBulletLine(src, e, lim, eol);
+          }
+          if (stop) break;
+        }
+        let blankLineU = true;
+        let hasTab = false;
+        for (let k = e; k < eol; k++) {
+          const c = src.charCodeAt(k);
+          if (c === 32) continue;
+          if (c === 9) hasTab = true;
+          else {
+            blankLineU = false;
+            break;
+          }
+        }
         const U = src.slice(e, eol);
-        const Z = expandLeadingTabs(U);
-        const lim = Math.max(0, Math.min(3, R - 1));
-        if (
-          isFenceLine(src, e, lim, eol) ||
-          isHeadingLine(src, e, lim, eol) ||
-          isHtmlLine(src, e, lim, eol) ||
-          isQuoteLine(src, e, lim, eol) ||
-          isBulletLine(src, e, lim, eol) ||
-          isHrLine(src, e, lim, eol)
-        )
-          break;
-        const ns = Z.search(/[^ ]/);
-        if (ns >= R || U.trim() === '') {
+        const Z = hasTab ? expandLeadingTabs(U) : U;
+        let nsZ = 0;
+        while (nsZ < Z.length && Z.charCodeAt(nsZ) === 32) nsZ++;
+        if (nsZ >= R || blankLineU) {
           text += '\n' + Z.slice(R);
         } else {
-          const lineNoTabs = line.replace(/\t/g, '    ');
-          if (
-            blank ||
-            lineNoTabs.search(/[^ ]/) >= 4 ||
-            isFenceStr(line, 3) ||
-            isHeadingStr(line, 3) ||
-            isHtmlStr(line, 3) ||
-            isHrStr(line, 3)
-          )
+          const lineNoTabs = line.indexOf('\t') < 0 ? line : line.replace(/\t/g, '    ');
+          let lns = 0;
+          while (lns < lineNoTabs.length && lineNoTabs.charCodeAt(lns) === 32) lns++;
+          if (blank || lns >= 4 || isFenceStr(line, 3) || isHeadingStr(line, 3) || isHtmlStr(line, 3) || isHrStr(line, 3))
             break;
-          if (/^ {0,3}(?:=+|-+) *$/.test(U) && !isHeadingLikeStr(line) && /^ {0,3}(?:=+|-+) *$/.test(U)) {
-            text += '\n' + '    ' + Z.replace(/^ {0,3}/, '');
+          if (isSetextLine(U) && !isHeadingLikeStr(line)) {
+            let k = 0;
+            while (k < 3 && k < Z.length && Z.charCodeAt(k) === 32) k++;
+            text += '\n' + '    ' + Z.slice(k);
           } else {
             text += '\n' + U;
           }
         }
-        blank = U.trim() === '';
+        blank = blankLineU;
         e = eol < n ? eol + 1 : n;
         line = Z.slice(R);
       }
@@ -909,6 +944,11 @@ function tryList(src, p, doc) {
 }
 
 // string-level variants used for the lazy-continuation checks
+const RE_SETEXT_LINE = /^ {0,3}(?:=+|-+) *$/;
+function isSetextLine(s) {
+  return RE_SETEXT_LINE.test(s);
+}
+
 function isHrStr(s, max) {
   let j = 0;
   let sp = 0;
@@ -1498,7 +1538,10 @@ function blockTokensInto(src, out, lazy, doc, topArg) {
         if (prev && (prev.type === 'para' || prev.type === 'text')) {
           prev.text += '\n' + r[1].raw;
         } else {
-          if (!doc.links[r[1].tag]) doc.links[r[1].tag] = { href: r[1].href, title: r[1].title };
+          if (!doc.links[r[1].tag]) {
+          doc.links[r[1].tag] = { href: r[1].href, title: r[1].title };
+          doc.hasLinks = true;
+        }
           out.push(r[1]);
         }
         continue;
@@ -1695,10 +1738,15 @@ const ESCAPABLE = new Uint8Array(128);
 for (const ch of '!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~') ESCAPABLE[ch.charCodeAt(0)] = 1;
 const STOP_TEXT = new Uint8Array(128);
 for (const ch of '\\<![`*~_') STOP_TEXT[ch.charCodeAt(0)] = 1;
+// 1 = stops a text run, 2 = space, 4 = possible scheme letter
+const TEXT_CLASS = new Uint8Array(128);
+for (let c = 0; c < 128; c++) if (STOP_TEXT[c]) TEXT_CLASS[c] = 1;
+TEXT_CLASS[32] = 2;
+for (const ch of 'hHfFwW') TEXT_CLASS[ch.charCodeAt(0)] |= 4;
 
 function maskSource(src, doc) {
   let t = src;
-  if (doc.links && src.includes('[') && hasLinks(doc)) {
+  if (doc.hasLinks && src.includes('[')) {
     t = t.replace(RE_REF_SEARCH, (m) => maskRef(m, doc));
   }
   if (t.includes('`') || t.includes('\\')) {
@@ -1713,11 +1761,6 @@ function maskSource(src, doc) {
     });
   }
   return t;
-}
-
-function hasLinks(doc) {
-  for (const k in doc.links) return true;
-  return false;
 }
 
 function maskRef(m, doc) {
@@ -1793,6 +1836,7 @@ function inlineCore(src, doc, plain) {
     }
     return lastNonWs;
   };
+  const hasAtAll = src.includes('@');
   let hasAt = -1;
   let runStart = -1;
   let runEnd = -1;
@@ -1807,17 +1851,26 @@ function inlineCore(src, doc, plain) {
   let masked = null;
   let lasts = null;
   const mask = () => {
-    if (masked === null) {
-      masked = maskSource(src, doc);
-      lasts = [-2, -2, -2];
-    }
+    if (masked === null) masked = maskSource(src, doc);
     return masked;
   };
   const lastOf = (code) => {
-    mask();
-    const slot = code === 42 ? 0 : code === 95 ? 1 : 2;
-    if (lasts[slot] === -2) lasts[slot] = lastDelimIndex(masked, code);
-    return lasts[slot];
+    if (lasts === null) {
+      const m = mask();
+      lasts = [-1, -1, -1];
+      const len = m.length;
+      for (let k = 0; k < len; k++) {
+        const ch = m.charCodeAt(k);
+        if (ch !== 42 && ch !== 95 && ch !== 126) continue;
+        const prev = k === 0 ? 10 : m.charCodeAt(k - 1);
+        let e = k + 1;
+        while (e < len && m.charCodeAt(e) === ch) e++;
+        if (!(prev === 32 || prev === 9 || prev === 10 || prev === 13 || prev === 12))
+          lasts[ch === 42 ? 0 : ch === 95 ? 1 : 2] = k;
+        k = e - 1;
+      }
+    }
+    return lasts[code === 42 ? 0 : code === 95 ? 1 : 2];
   };
   while (i < n) {
     const c = src.charCodeAt(i);
@@ -1934,8 +1987,8 @@ function inlineCore(src, doc, plain) {
     }
     if (!state.inLink) {
       const lower = c | 32;
-      let tryUrl = lower === 104 || lower === 102 || c === 119;
-      if (hasAt < 0) hasAt = src.includes('@') ? 1 : 0;
+      let tryUrl = (lower === 104 || lower === 102 || c === 119) && schemeAt(src, i, c);
+      if (hasAt < 0) hasAt = hasAtAll ? 1 : 0;
       if (!tryUrl && hasAt && isLocalChar(c)) {
         if (lower === 109 && src.startsWith('mailto:', i)) tryUrl = true;
         else if (lower === 120 && src.startsWith('xmpp:', i)) tryUrl = true;
@@ -1955,7 +2008,7 @@ function inlineCore(src, doc, plain) {
         }
       }
     }
-    const len = scanInlineText(src, i);
+    const len = scanInlineText(src, i, hasAtAll);
     if (len <= 0) throw FALLBACK;
     const raw = src.slice(i, i + len);
     if (raw.includes('&')) {
@@ -1967,6 +2020,32 @@ function inlineCore(src, doc, plain) {
     lastChar = raw.charCodeAt(raw.length - 1) === 95 ? '' : raw[raw.length - 1];
   }
   return out;
+}
+
+// Whether one of the URL rule's prefixes (http(s)://, ftp://, www.) is here.
+function schemeAt(src, i, c) {
+  if (c === 119) {
+    return src.charCodeAt(i + 1) === 119 && src.charCodeAt(i + 2) === 119 && src.charCodeAt(i + 3) === 46;
+  }
+  if ((c | 32) === 104) {
+    return (
+      (src.charCodeAt(i + 1) | 32) === 116 &&
+      (src.charCodeAt(i + 2) | 32) === 116 &&
+      (src.charCodeAt(i + 3) | 32) === 112 &&
+      ((src.charCodeAt(i + 4) === 58 && src.charCodeAt(i + 5) === 47 && src.charCodeAt(i + 6) === 47) ||
+        ((src.charCodeAt(i + 4) | 32) === 115 &&
+          src.charCodeAt(i + 5) === 58 &&
+          src.charCodeAt(i + 6) === 47 &&
+          src.charCodeAt(i + 7) === 47))
+    );
+  }
+  return (
+    (src.charCodeAt(i + 1) | 32) === 116 &&
+    (src.charCodeAt(i + 2) | 32) === 112 &&
+    src.charCodeAt(i + 3) === 58 &&
+    src.charCodeAt(i + 4) === 47 &&
+    src.charCodeAt(i + 5) === 47
+  );
 }
 
 function urlToken(m, plain) {
@@ -2158,8 +2237,6 @@ function tryCodespan(src, i) {
 function tryEmStrong(src, i, doc, plain, lastChar, mask, lastOf) {
   const c = src.charCodeAt(i);
   const ch = c === 42 ? '*' : '_';
-  const masked = mask();
-  if (masked[i] !== ch) return null;
   let k = 0;
   while (i + k < src.length && src.charCodeAt(i + k) === c) k++;
   let s1 = '';
@@ -2177,6 +2254,8 @@ function tryEmStrong(src, i, doc, plain, lastChar, mask, lastOf) {
     }
   }
   if (!s1 && !s2 && !s3 && !s4) return null;
+  const masked = mask();
+  if (masked[i] !== ch) return null;
   const g1 = s1 || s3;
   const o = lastChar === ch;
   let l = i;
@@ -2232,8 +2311,6 @@ function tryEmStrong(src, i, doc, plain, lastChar, mask, lastOf) {
 }
 
 function tryDel(src, i, doc, plain, lastChar, mask, lastOf) {
-  const masked = mask();
-  if (masked[i] !== '~') return null;
   let k = 0;
   while (i + k < src.length && src.charCodeAt(i + k) === 126) k++;
   if (k > 2) return null;
@@ -2244,6 +2321,9 @@ function tryDel(src, i, doc, plain, lastChar, mask, lastOf) {
       if (isPunctChar(nc)) g1 = nc;
     }
   }
+  if (!g1 && !(i + k < src.length && !isSpaceChar(src[i + k]) && src[i + k] !== '~')) return null;
+  const masked = mask();
+  if (masked[i] !== '~') return null;
   if (!g1 || !lastChar || isPunctOrSpace(lastChar)) {
     const o = k;
     let p = o;
@@ -2275,7 +2355,7 @@ function tryDel(src, i, doc, plain, lastChar, mask, lastOf) {
   return null;
 }
 
-function scanInlineText(src, i) {
+function scanInlineText(src, i, hasAtAll) {
   const n = src.length;
   const c0 = src.charCodeAt(i);
   if (c0 === 96 || c0 === 126) {
@@ -2285,43 +2365,46 @@ function scanInlineText(src, i) {
       const nc = src.charCodeAt(i + k);
       if (nc === 96 || nc === 126) return k;
     }
-    return k + scanTextRun(src, i + k, n);
+    return k + scanTextRun(src, i + k, n, hasAtAll);
   }
   if (!isAsciiAlnum(c0)) {
     if (src.startsWith('mailto:', i + 1) || src.startsWith('xmpp:', i + 1)) return 1;
   }
-  return 1 + scanTextRun(src, i + 1, n);
+  return 1 + scanTextRun(src, i + 1, n, hasAtAll);
 }
 
 function isAsciiAlnum(c) {
   return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
 }
 
-function scanTextRun(src, from, n) {
-  let atPos = src.indexOf('@', from);
+function scanTextRun(src, from, n, hasAtAll) {
+  let atPos = hasAtAll ? src.indexOf('@', from) : -1;
   if (atPos < 0) {
     // no e-mail can start ahead: only stop characters, schemes and hard breaks
     let j = from;
     while (j < n) {
       const c = src.charCodeAt(j);
-      if (c < 128) {
-        if (STOP_TEXT[c]) break;
-        if (c === 32) {
-          let m = j + 1;
-          while (m < n && src.charCodeAt(m) === 32) m++;
-          if (m - j >= 2 && m < n && src.charCodeAt(m) === 10) return j - from;
-          j = m;
-          continue;
-        }
-        if ((c | 32) === 104) {
-          if (((src.charCodeAt(j + 1) | 32) === 116) && ((src.charCodeAt(j + 2) | 32) === 116) && ((src.charCodeAt(j + 3) | 32) === 112)) break;
-        } else if ((c | 32) === 102) {
-          if (((src.charCodeAt(j + 1) | 32) === 116) && ((src.charCodeAt(j + 2) | 32) === 112) && src.charCodeAt(j + 3) === 58 && src.charCodeAt(j + 4) === 47 && src.charCodeAt(j + 5) === 47) break;
-        } else if (c === 119) {
-          if (src.charCodeAt(j + 1) === 119 && src.charCodeAt(j + 2) === 119 && src.charCodeAt(j + 3) === 46) {
-            const prev = j === 0 ? 10 : src.charCodeAt(j - 1);
-            if (prev === 42 || prev === 95 || prev === 126 || prev === 40 || prev === 0 || prev === 32 || prev === 9 || prev === 10 || prev === 13 || prev === 12) break;
-          }
+      const cl = c < 128 ? TEXT_CLASS[c] : 0;
+      if (cl === 0) {
+        j++;
+        continue;
+      }
+      if (cl & 1) break;
+      if (cl & 2) {
+        let m = j + 1;
+        while (m < n && src.charCodeAt(m) === 32) m++;
+        if (m - j >= 2 && m < n && src.charCodeAt(m) === 10) return j - from;
+        j = m;
+        continue;
+      }
+      if ((c | 32) === 104) {
+        if (((src.charCodeAt(j + 1) | 32) === 116) && ((src.charCodeAt(j + 2) | 32) === 116) && ((src.charCodeAt(j + 3) | 32) === 112)) break;
+      } else if ((c | 32) === 102) {
+        if (((src.charCodeAt(j + 1) | 32) === 116) && ((src.charCodeAt(j + 2) | 32) === 112) && src.charCodeAt(j + 3) === 58 && src.charCodeAt(j + 4) === 47 && src.charCodeAt(j + 5) === 47) break;
+      } else if (c === 119) {
+        if (src.charCodeAt(j + 1) === 119 && src.charCodeAt(j + 2) === 119 && src.charCodeAt(j + 3) === 46) {
+          const prev = j === 0 ? 10 : src.charCodeAt(j - 1);
+          if (prev === 42 || prev === 95 || prev === 126 || prev === 40 || prev === 0 || prev === 32 || prev === 9 || prev === 10 || prev === 13 || prev === 12) break;
         }
       }
       j++;
